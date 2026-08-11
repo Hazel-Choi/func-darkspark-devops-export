@@ -27,7 +27,7 @@ jobs:
       - name: Setup Python version
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: '3.11'
 
       - name: Create and start virtual environment
         run: |

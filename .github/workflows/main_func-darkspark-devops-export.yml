@@ -27,7 +27,7 @@ jobs:
       - name: Setup Python version
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.14'
 
       - name: Create and start virtual environment
         run: |
@@ -82,4 +82,7 @@ jobs:
           app-name: 'func-darkspark-devops-export'
           slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
+          scm-do-build-during-deployment: true
+          enable-oryx-build: true
+          remote-build: true
           

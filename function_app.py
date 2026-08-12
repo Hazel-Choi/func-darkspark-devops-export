@@ -8,7 +8,7 @@ from azure.mgmt.sql import SqlManagementClient
 app = func.FunctionApp()
 
 # --- Configure these two for your tenant ---
-KEY_VAULT_URL = "https://kv-darkspark-centralsystem.vault.azure.net/"
+KEY_VAULT_URL = "https://kv-centralsystem.vault.azure.net/"
 DEVOPS_ORG = "DarkSparkConsulting"
 # --------------------------------------------
 

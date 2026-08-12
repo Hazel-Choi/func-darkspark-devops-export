@@ -1,4 +1,5 @@
 azure-functions
 azure-identity
+azure-mgmt-sql
 azure-keyvault-secrets
 requests

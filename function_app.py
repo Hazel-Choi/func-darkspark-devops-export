@@ -6,7 +6,7 @@ import os
 from datetime import datetime, timezone
 
 import azure.functions as func
-import pytds
+import pyodbc
 import requests
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
@@ -174,23 +174,6 @@ def resume_central_sql(resumeTimer: func.TimerRequest) -> None:
 # Project export orchestrator
 # =====================================================================
 
-def _resolve_ca_bundle() -> str | None:
-    """
-    Azure SQL requires TLS on every connection, and pytds needs an explicit
-    CA bundle path to negotiate it. The exact path varies by Linux base
-    image, so try the common candidates rather than hardcoding one.
-    """
-    candidates = [
-        "/etc/ssl/certs/ca-certificates.crt",  # Debian/Ubuntu-based
-        "/etc/pki/tls/certs/ca-bundle.crt",    # RHEL/CentOS/Mariner-based
-        "/etc/ssl/cert.pem",                   # Alpine-based
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    return None
-
-
 def _get_active_projects(kv_client: SecretClient) -> list[dict]:
     """
     Reads core.vw_ActiveExportableProjects — only fully-configured, active
@@ -198,25 +181,24 @@ def _get_active_projects(kv_client: SecretClient) -> list[dict]:
     EffortUnit or with IsActive=0 simply isn't returned, so incomplete
     projects are skipped with zero special-casing in this code.
 
-    Uses python-tds (pure Python, no native ODBC driver dependency) rather
-    than pyodbc, since driver availability on Flex Consumption's Python 3.14
-    image is unverified — this avoids repeating the packaging issues hit
-    earlier with this Function App.
+    Uses pyodbc (the standard Microsoft-supported path for Python + Azure
+    SQL) after python-tds hit an unresolvable upstream compatibility bug
+    between its TLS handling and current pyOpenSSL/cryptography versions.
+    Requires the ODBC Driver 18 for SQL Server to be present on the host —
+    if it isn't, this will fail with a clear "driver not found" error rather
+    than an obscure one.
     """
     password = kv_client.get_secret(SQL_READER_PASSWORD_SECRET_NAME).value
-    cafile = _resolve_ca_bundle()
-    if cafile is None:
-        logging.warning("No CA bundle found at any known path — TLS connection to Azure SQL will likely fail.")
-
-    conn = pytds.connect(
-        server=SQL_SERVER_HOST,
-        database=SQL_DATABASE_NAME,
-        user=SQL_READER_USER,
-        password=password,
-        port=1433,
-        autocommit=True,
-        cafile=cafile,
+    conn_str = (
+        "Driver={ODBC Driver 18 for SQL Server};"
+        f"Server=tcp:{SQL_SERVER_HOST},1433;"
+        f"Database={SQL_DATABASE_NAME};"
+        f"Uid={SQL_READER_USER};"
+        f"Pwd={password};"
+        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
     )
+
+    conn = pyodbc.connect(conn_str)
     try:
         cursor = conn.cursor()
         cursor.execute(

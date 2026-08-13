@@ -3,7 +3,5 @@ azure-identity
 azure-mgmt-sql
 azure-keyvault-secrets
 requests
-python-tds
 azure-storage-blob
-pyOpenSSL
 pyodbc

@@ -5,3 +5,4 @@ azure-keyvault-secrets
 requests
 python-tds
 azure-storage-blob
+pyOpenSSL

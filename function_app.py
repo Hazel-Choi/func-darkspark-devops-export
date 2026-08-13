@@ -3,7 +3,6 @@ import io
 import json
 import logging
 import os
-import traceback
 from datetime import datetime, timezone
 
 import azure.functions as func
@@ -39,27 +38,6 @@ SQL_READER_PASSWORD_SECRET_NAME = "sql-func-project-config-reader-password"
 LANDING_STORAGE_ACCOUNT_URL = "https://stdarksparklanding.blob.core.windows.net"
 LANDING_CONTAINER_NAME = "automated-exports"  # adjust if you'd rather use a different container name
 # ------------------------------
-
-
-@app.function_name(name="TestActiveProjectsQuery")
-@app.route(route="test-active-projects-query", auth_level=func.AuthLevel.FUNCTION)
-def test_active_projects_query(req: func.HttpRequest) -> func.HttpResponse:
-    """
-    TEMPORARY diagnostic — remove once RunProjectExports is confirmed working.
-    Calls the exact same _get_active_projects() the timer trigger uses, and
-    returns the result (or the exact exception) directly in the response body.
-    """
-    credential = DefaultAzureCredential()
-    kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
-    try:
-        projects = _get_active_projects(kv_client)
-        return func.HttpResponse(
-            f"Success. Found {len(projects)} project(s):\n{json.dumps(projects, indent=2, default=str)}",
-            status_code=200,
-        )
-    except Exception as e:
-        tb = traceback.format_exc()
-        return func.HttpResponse(f"FAILED: {type(e).__name__}: {e}\n\nFull traceback:\n{tb}", status_code=500)
 
 
 @app.function_name(name="TestDevOpsAuth")

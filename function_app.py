@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import traceback
 from datetime import datetime, timezone
 
 import azure.functions as func
@@ -57,7 +58,8 @@ def test_active_projects_query(req: func.HttpRequest) -> func.HttpResponse:
             status_code=200,
         )
     except Exception as e:
-        return func.HttpResponse(f"FAILED: {type(e).__name__}: {e}", status_code=500)
+        tb = traceback.format_exc()
+        return func.HttpResponse(f"FAILED: {type(e).__name__}: {e}\n\nFull traceback:\n{tb}", status_code=500)
 
 
 @app.function_name(name="TestDevOpsAuth")
@@ -195,7 +197,7 @@ def _get_active_projects(kv_client: SecretClient) -> list[dict]:
         f"Database={SQL_DATABASE_NAME};"
         f"Uid={SQL_READER_USER};"
         f"Pwd={password};"
-        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;"
     )
 
     conn = pyodbc.connect(conn_str)

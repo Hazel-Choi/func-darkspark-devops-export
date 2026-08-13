@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 
 import azure.functions as func
@@ -178,7 +179,24 @@ def _get_active_projects(kv_client: SecretClient) -> list[dict]:
         "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;"
     )
 
-    conn = pyodbc.connect(conn_str)
+    # The database's own inactivity-based auto-pause is independent of our
+    # PauseCentralSql/ResumeCentralSql schedule — if it's gone to sleep
+    # between runs, the first connection attempt can time out waking it,
+    # even though that same attempt kicks off the resume server-side. Retry
+    # a couple of times with backoff rather than failing the whole run.
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            conn = pyodbc.connect(conn_str)
+            break
+        except pyodbc.Error as e:
+            last_error = e
+            logging.warning(f"SQL connection attempt {attempt}/3 failed: {e}")
+            if attempt < 3:
+                time.sleep(15 * attempt)
+    else:
+        raise last_error
+
     try:
         cursor = conn.cursor()
         cursor.execute(

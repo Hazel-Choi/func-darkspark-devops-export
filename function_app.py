@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import logging
+import os
 from datetime import datetime, timezone
 
 import azure.functions as func
@@ -173,6 +174,23 @@ def resume_central_sql(resumeTimer: func.TimerRequest) -> None:
 # Project export orchestrator
 # =====================================================================
 
+def _resolve_ca_bundle() -> str | None:
+    """
+    Azure SQL requires TLS on every connection, and pytds needs an explicit
+    CA bundle path to negotiate it. The exact path varies by Linux base
+    image, so try the common candidates rather than hardcoding one.
+    """
+    candidates = [
+        "/etc/ssl/certs/ca-certificates.crt",  # Debian/Ubuntu-based
+        "/etc/pki/tls/certs/ca-bundle.crt",    # RHEL/CentOS/Mariner-based
+        "/etc/ssl/cert.pem",                   # Alpine-based
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def _get_active_projects(kv_client: SecretClient) -> list[dict]:
     """
     Reads core.vw_ActiveExportableProjects — only fully-configured, active
@@ -186,6 +204,9 @@ def _get_active_projects(kv_client: SecretClient) -> list[dict]:
     earlier with this Function App.
     """
     password = kv_client.get_secret(SQL_READER_PASSWORD_SECRET_NAME).value
+    cafile = _resolve_ca_bundle()
+    if cafile is None:
+        logging.warning("No CA bundle found at any known path — TLS connection to Azure SQL will likely fail.")
 
     conn = pytds.connect(
         server=SQL_SERVER_HOST,
@@ -194,6 +215,7 @@ def _get_active_projects(kv_client: SecretClient) -> list[dict]:
         password=password,
         port=1433,
         autocommit=True,
+        cafile=cafile,
     )
     try:
         cursor = conn.cursor()

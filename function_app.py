@@ -1,9 +1,19 @@
+import csv
+import io
+import json
 import logging
+from datetime import datetime, timezone
+
 import azure.functions as func
+import pytds
 import requests
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
 from azure.mgmt.sql import SqlManagementClient
+from azure.storage.blob import BlobServiceClient
+
+import devops_export_to_payload as devops_exporter
+import jira_export_to_payload as jira_exporter
 
 app = func.FunctionApp()
 
@@ -18,6 +28,15 @@ RESOURCE_GROUP = "HC_Experiments"
 SQL_SERVER_NAME = "centralsystem"
 SQL_DATABASE_NAME = "darkspark-central-system"
 # ----------------------------------------
+
+# --- Project export config ---
+SQL_SERVER_HOST = "centralsystem.database.windows.net"
+SQL_READER_USER = "func_project_config_reader"
+SQL_READER_PASSWORD_SECRET_NAME = "sql-func-project-config-reader-password"
+
+LANDING_STORAGE_ACCOUNT_URL = "https://stdarksparklanding.blob.core.windows.net"
+LANDING_CONTAINER_NAME = "automated-exports"  # adjust if you'd rather use a different container name
+# ------------------------------
 
 
 @app.function_name(name="TestDevOpsAuth")
@@ -128,3 +147,190 @@ def resume_central_sql(resumeTimer: func.TimerRequest) -> None:
         logging.info("Database resume completed.")
     except Exception as e:
         logging.warning(f"Resume request finished with a non-fatal issue: {e}")
+
+
+# =====================================================================
+# Project export orchestrator
+# =====================================================================
+
+def _get_active_projects(kv_client: SecretClient) -> list[dict]:
+    """
+    Reads core.vw_ActiveExportableProjects — only fully-configured, active
+    projects appear here. A project missing OrgOrSite/SourceProjectName/
+    EffortUnit or with IsActive=0 simply isn't returned, so incomplete
+    projects are skipped with zero special-casing in this code.
+
+    Uses python-tds (pure Python, no native ODBC driver dependency) rather
+    than pyodbc, since driver availability on Flex Consumption's Python 3.14
+    image is unverified — this avoids repeating the packaging issues hit
+    earlier with this Function App.
+    """
+    password = kv_client.get_secret(SQL_READER_PASSWORD_SECRET_NAME).value
+
+    conn = pytds.connect(
+        server=SQL_SERVER_HOST,
+        database=SQL_DATABASE_NAME,
+        user=SQL_READER_USER,
+        password=password,
+        port=1433,
+        autocommit=True,
+    )
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT ProjectCode, SourceSystem, OrgOrSite, SourceProjectName, "
+            "EffortUnit, JiraStoryPointsField, KeyVaultSecretName "
+            "FROM core.vw_ActiveExportableProjects"
+        )
+        columns = [col[0] for col in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def _watermark_blob_client(blob_service_client: BlobServiceClient, project_code: str):
+    return blob_service_client.get_blob_client(
+        container=LANDING_CONTAINER_NAME, blob=f"_watermarks/{project_code}.json"
+    )
+
+
+def _load_watermark(blob_service_client: BlobServiceClient, project_code: str):
+    """Returns a UTC datetime, or None if no watermark yet (-> full export)."""
+    blob_client = _watermark_blob_client(blob_service_client, project_code)
+    try:
+        raw = blob_client.download_blob().readall()
+        payload = json.loads(raw)
+        return datetime.fromisoformat(payload["last_run_start_utc"])
+    except Exception:
+        # Blob doesn't exist yet, or is corrupt — either way, fall back to a
+        # full export rather than fail the whole run.
+        return None
+
+
+def _save_watermark(blob_service_client: BlobServiceClient, project_code: str, run_start_utc: datetime) -> None:
+    blob_client = _watermark_blob_client(blob_service_client, project_code)
+    payload = json.dumps({"last_run_start_utc": run_start_utc.isoformat()})
+    blob_client.upload_blob(payload, overwrite=True)
+
+
+def _rows_to_csv_text(rows: list[dict], columns: list[str]) -> str:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=columns)
+    writer.writeheader()
+    writer.writerows(rows)
+    return buffer.getvalue()
+
+
+def _upload_csv(blob_service_client: BlobServiceClient, project_code: str, source_system: str,
+                 run_start_utc: datetime, csv_text: str) -> str:
+    timestamp = run_start_utc.strftime("%Y%m%dT%H%M%S")
+    filename = f"{source_system}_{project_code}_{timestamp}Z.csv"
+    blob_path = f"{project_code}/{filename}"
+    blob_client = blob_service_client.get_blob_client(container=LANDING_CONTAINER_NAME, blob=blob_path)
+    blob_client.upload_blob(csv_text, overwrite=True)
+    return blob_path
+
+
+def _process_devops_project(kv_client: SecretClient, blob_service_client: BlobServiceClient, project: dict) -> int:
+    project_code = project["ProjectCode"]
+    pat = kv_client.get_secret(project["KeyVaultSecretName"]).value
+
+    run_start_utc = datetime.now(timezone.utc)
+    since_dt = _load_watermark(blob_service_client, project_code)
+    if since_dt is None:
+        logging.warning(f"{project_code}: no watermark found — this will be a FULL export.")
+
+    session = requests.Session()
+    session.auth = ("", pat)
+
+    ids = devops_exporter.fetch_work_item_ids(session, project["OrgOrSite"], project["SourceProjectName"], since_dt)
+    if not ids:
+        logging.info(f"{project_code}: no work items in this window.")
+        _save_watermark(blob_service_client, project_code, run_start_utc)
+        return 0
+
+    all_items = []
+    for batch in devops_exporter.chunk(ids, devops_exporter.BATCH_SIZE):
+        all_items.extend(devops_exporter.fetch_work_items_batch(session, project["OrgOrSite"], batch))
+
+    rows = devops_exporter.build_rows(all_items, project_code, project["EffortUnit"])
+    csv_text = _rows_to_csv_text(rows, devops_exporter.STANDARD_COLUMNS)
+    blob_path = _upload_csv(blob_service_client, project_code, "AzureDevOps", run_start_utc, csv_text)
+    _save_watermark(blob_service_client, project_code, run_start_utc)
+
+    logging.info(f"{project_code}: wrote {len(rows)} rows to {blob_path}")
+    return len(rows)
+
+
+def _process_jira_project(kv_client: SecretClient, blob_service_client: BlobServiceClient, project: dict) -> int:
+    project_code = project["ProjectCode"]
+    secret_value = kv_client.get_secret(project["KeyVaultSecretName"]).value
+
+    # Jira auth is (email, token) — stored as a single secret in "email:token"
+    # format, since ProjectCredential only has one KeyVaultSecretName column.
+    if ":" not in secret_value:
+        raise ValueError(
+            f"{project_code}: Jira secret '{project['KeyVaultSecretName']}' must be "
+            f"in 'email:token' format — got a value with no ':' separator."
+        )
+    email, token = secret_value.split(":", 1)
+
+    run_start_utc = datetime.now(timezone.utc)
+    since_dt = _load_watermark(blob_service_client, project_code)
+    if since_dt is None:
+        logging.warning(f"{project_code}: no watermark found — this will be a FULL export.")
+
+    session = requests.Session()
+    session.auth = (email, token)
+    session.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
+
+    story_points_field = project.get("JiraStoryPointsField") or None
+
+    issues = jira_exporter.fetch_issues(
+        session, project["OrgOrSite"], project["SourceProjectName"], story_points_field, since_dt
+    )
+    if not issues:
+        logging.info(f"{project_code}: no issues in this window.")
+        _save_watermark(blob_service_client, project_code, run_start_utc)
+        return 0
+
+    rows = jira_exporter.build_rows(issues, project_code, project["EffortUnit"], story_points_field)
+    csv_text = _rows_to_csv_text(rows, jira_exporter.STANDARD_COLUMNS)
+    blob_path = _upload_csv(blob_service_client, project_code, "Jira", run_start_utc, csv_text)
+    _save_watermark(blob_service_client, project_code, run_start_utc)
+
+    logging.info(f"{project_code}: wrote {len(rows)} rows to {blob_path}")
+    return len(rows)
+
+
+@app.function_name(name="RunProjectExports")
+@app.timer_trigger(schedule="0 0 8,12,18 * * *", arg_name="exportTimer", run_on_startup=False)
+def run_project_exports(exportTimer: func.TimerRequest) -> None:
+    """
+    Runs at 8am, 12pm, and 6pm daily. Reads core.vw_ActiveExportableProjects
+    (only complete, active projects), then loops per project with isolated
+    exception handling — one client's failure never blocks the others.
+    """
+    credential = DefaultAzureCredential()
+    kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
+    blob_service_client = BlobServiceClient(account_url=LANDING_STORAGE_ACCOUNT_URL, credential=credential)
+
+    try:
+        projects = _get_active_projects(kv_client)
+    except Exception as e:
+        logging.error(f"Could not read active project list from SQL: {e}")
+        return
+
+    logging.info(f"Found {len(projects)} active, fully-configured project(s) to export.")
+
+    for project in projects:
+        project_code = project["ProjectCode"]
+        try:
+            if project["SourceSystem"] == "AzureDevOps":
+                _process_devops_project(kv_client, blob_service_client, project)
+            elif project["SourceSystem"] == "Jira":
+                _process_jira_project(kv_client, blob_service_client, project)
+            else:
+                logging.warning(f"{project_code}: unknown SourceSystem '{project['SourceSystem']}', skipping.")
+        except Exception as e:
+            logging.error(f"{project_code}: export failed — {e}")

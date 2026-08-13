@@ -39,6 +39,26 @@ LANDING_CONTAINER_NAME = "automated-exports"  # adjust if you'd rather use a dif
 # ------------------------------
 
 
+@app.function_name(name="TestActiveProjectsQuery")
+@app.route(route="test-active-projects-query", auth_level=func.AuthLevel.FUNCTION)
+def test_active_projects_query(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    TEMPORARY diagnostic — remove once RunProjectExports is confirmed working.
+    Calls the exact same _get_active_projects() the timer trigger uses, and
+    returns the result (or the exact exception) directly in the response body.
+    """
+    credential = DefaultAzureCredential()
+    kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
+    try:
+        projects = _get_active_projects(kv_client)
+        return func.HttpResponse(
+            f"Success. Found {len(projects)} project(s):\n{json.dumps(projects, indent=2, default=str)}",
+            status_code=200,
+        )
+    except Exception as e:
+        return func.HttpResponse(f"FAILED: {type(e).__name__}: {e}", status_code=500)
+
+
 @app.function_name(name="TestDevOpsAuth")
 @app.route(route="test-devops-auth", auth_level=func.AuthLevel.FUNCTION)
 def test_devops_auth(req: func.HttpRequest) -> func.HttpResponse:

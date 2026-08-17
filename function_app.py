@@ -38,6 +38,14 @@ SQL_READER_PASSWORD_SECRET_NAME = "sql-func-project-config-reader-password"
 
 LANDING_STORAGE_ACCOUNT_URL = "https://stdarksparklanding.blob.core.windows.net"
 LANDING_CONTAINER_NAME = "automated-exports"  # adjust if you'd rather use a different container name
+
+# Any project whose OrgOrSite matches this falls back to a shared PAT if its
+# own per-project/per-staff secret lookup fails. Covers new/interim projects
+# (e.g. DKSP-INTL) that don't have a dedicated credential set up yet. The
+# secret itself can be rotated in Key Vault at any time without touching
+# this code — only the secret *name* below needs to stay in sync.
+FALLBACK_ORG = "DarkSparkConsulting"
+FALLBACK_DEVOPS_SECRET_NAME = "devops-pat-darkspark-all-hazel"
 # ------------------------------
 
 
@@ -255,7 +263,18 @@ def _upload_csv(blob_service_client: BlobServiceClient, project_code: str, sourc
 
 def _process_devops_project(kv_client: SecretClient, blob_service_client: BlobServiceClient, project: dict) -> int:
     project_code = project["ProjectCode"]
-    pat = kv_client.get_secret(project["KeyVaultSecretName"]).value
+    secret_name = project["KeyVaultSecretName"]
+
+    try:
+        pat = kv_client.get_secret(secret_name).value
+    except Exception as primary_err:
+        if project.get("OrgOrSite") != FALLBACK_ORG:
+            raise
+        logging.warning(
+            f"{project_code}: primary secret '{secret_name}' failed ({primary_err}); "
+            f"trying fallback '{FALLBACK_DEVOPS_SECRET_NAME}'"
+        )
+        pat = kv_client.get_secret(FALLBACK_DEVOPS_SECRET_NAME).value
 
     run_start_utc = datetime.now(timezone.utc)
     since_dt = _load_watermark(blob_service_client, project_code)

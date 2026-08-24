@@ -143,7 +143,7 @@ def pause_central_sql(pauseTimer: func.TimerRequest) -> None:
 
 
 @app.function_name(name="ResumeCentralSql")
-@app.timer_trigger(schedule="0 0 7 * * 1-5", arg_name="resumeTimer", run_on_startup=False)
+@app.timer_trigger(schedule="0 0 5 * * 1-5", arg_name="resumeTimer", run_on_startup=False)
 def resume_central_sql(resumeTimer: func.TimerRequest) -> None:
     """
     Weekday 7am resume for darkspark-central-system, warmed up before the first

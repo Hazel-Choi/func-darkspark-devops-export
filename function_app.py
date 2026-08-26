@@ -29,6 +29,8 @@ SUBSCRIPTION_ID = "9af8ed4d-1ade-425e-870f-bd79eb8e00ce"
 RESOURCE_GROUP = "HC_Experiments"
 SQL_SERVER_NAME = "centralsystem"
 SQL_DATABASE_NAME = "darkspark-central-system"
+SQL_RECONCILE_WRITER_USER = "func_project_reconcile_writer"
+SQL_RECONCILE_WRITER_PASSWORD_SECRET_NAME = "sql-func-project-reconcile-writer-password"
 # ----------------------------------------
 
 # --- Project export config ---
@@ -119,6 +121,27 @@ def test_devops_auth(req: func.HttpRequest) -> func.HttpResponse:
 def _get_sql_client() -> SqlManagementClient:
     credential = DefaultAzureCredential()
     return SqlManagementClient(credential, SUBSCRIPTION_ID)
+
+def _connect_sql(kv_client: SecretClient, user: str, password_secret_name: str) -> pyodbc.Connection:
+    password = kv_client.get_secret(password_secret_name).value
+    conn_str = (
+        "Driver={ODBC Driver 18 for SQL Server};"
+        f"Server=tcp:{SQL_SERVER_HOST},1433;"
+        f"Database={SQL_DATABASE_NAME};"
+        f"Uid={user};"
+        f"Pwd={password};"
+        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;"
+    )
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            return pyodbc.connect(conn_str)
+        except pyodbc.Error as e:
+            last_error = e
+            logging.warning(f"SQL connection attempt {attempt}/3 failed ({user}): {e}")
+            if attempt < 3:
+                time.sleep(15 * attempt)
+    raise last_error
 
 
 @app.function_name(name="PauseCentralSql")
@@ -375,3 +398,128 @@ def run_project_exports(exportTimer: func.TimerRequest) -> None:
                 logging.warning(f"{project_code}: unknown SourceSystem '{project['SourceSystem']}', skipping.")
         except Exception as e:
             logging.error(f"{project_code}: export failed — {e}")
+
+
+# =====================================================================
+# Deleted work item reconciliation
+# =====================================================================
+
+def _get_existing_work_item_ids(reader_conn: pyodbc.Connection, project_code: str, source_system: str) -> set[str]:
+    cursor = reader_conn.cursor()
+    cursor.execute(
+        "SELECT WorkItemId FROM core.SharePointWorkItem "
+        "WHERE ProjectCode = ? AND SourceSystem = ? AND IsDeleted = 0",
+        project_code, source_system,
+    )
+    return {str(row[0]) for row in cursor.fetchall()}
+
+
+def _flag_deleted_work_items(writer_conn: pyodbc.Connection, project_code: str, source_system: str, deleted_ids: list[str]) -> None:
+    if not deleted_ids:
+        return
+    placeholders = ",".join("?" for _ in deleted_ids)
+    cursor = writer_conn.cursor()
+    cursor.execute(
+        f"UPDATE core.SharePointWorkItem "
+        f"SET IsDeleted = 1 "
+        f"WHERE ProjectCode = ? AND SourceSystem = ? AND WorkItemId IN ({placeholders})",
+        project_code, source_system, *deleted_ids,
+    )
+    writer_conn.commit()
+
+
+def _reconcile_devops_project(kv_client: SecretClient, reader_conn, writer_conn, project: dict) -> int:
+    project_code = project["ProjectCode"]
+    secret_name = project["KeyVaultSecretName"]
+
+    try:
+        pat = kv_client.get_secret(secret_name).value
+    except Exception as primary_err:
+        if project.get("OrgOrSite") != FALLBACK_ORG:
+            raise
+        logging.warning(f"{project_code}: primary secret failed ({primary_err}); trying fallback PAT")
+        pat = kv_client.get_secret(FALLBACK_DEVOPS_SECRET_NAME).value
+
+    session = requests.Session()
+    session.auth = ("", pat)
+
+    # since_dt=None -> full pull of every currently-live work item ID.
+    # devops_export_to_payload's WIQL already excludes State='Removed', so
+    # soft-removed and hard-deleted items both fall out of this list.
+    live_ids = {str(i) for i in devops_exporter.fetch_work_item_ids(
+        session, project["OrgOrSite"], project["SourceProjectName"], None
+    )}
+
+    existing_ids = _get_existing_work_item_ids(reader_conn, project_code, "AzureDevOps")
+    deleted_ids = list(existing_ids - live_ids)
+
+    _flag_deleted_work_items(writer_conn, project_code, "AzureDevOps", deleted_ids)
+    return len(deleted_ids)
+
+
+def _reconcile_jira_project(kv_client: SecretClient, reader_conn, writer_conn, project: dict) -> int:
+    project_code = project["ProjectCode"]
+    secret_value = kv_client.get_secret(project["KeyVaultSecretName"]).value
+    if ":" not in secret_value:
+        raise ValueError(f"{project_code}: Jira secret must be 'email:token' format.")
+    email, token = secret_value.split(":", 1)
+
+    session = requests.Session()
+    session.auth = (email, token)
+    session.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
+
+    story_points_field = project.get("JiraStoryPointsField") or None
+
+    # since_dt=None -> full pull; a deleted issue simply never appears here.
+    issues = jira_exporter.fetch_issues(
+        session, project["OrgOrSite"], project["SourceProjectName"], story_points_field, None
+    )
+    live_ids = {issue["key"] for issue in issues}
+
+    existing_ids = _get_existing_work_item_ids(reader_conn, project_code, "Jira")
+    deleted_ids = list(existing_ids - live_ids)
+
+    _flag_deleted_work_items(writer_conn, project_code, "Jira", deleted_ids)
+    return len(deleted_ids)
+
+
+@app.function_name(name="ReconcileDeletedWorkItems")
+@app.timer_trigger(schedule="0 0 3 * * *", arg_name="reconcileTimer", run_on_startup=False)
+def reconcile_deleted_work_items(reconcileTimer: func.TimerRequest) -> None:
+    """
+    Runs once daily at 3am — deliberately less frequent than RunProjectExports,
+    since this does a full (non-delta) ID pull per project rather than a
+    watermark-filtered one. Flags core.SharePointWorkItem.IsDeleted = 1 for any
+    WorkItemId no longer present in the source system at all — delta exports
+    can never catch this on their own, since a deletion produces no "changed"
+    event to pick up.
+    """
+    credential = DefaultAzureCredential()
+    kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
+
+    try:
+        projects = _get_active_projects(kv_client)
+    except Exception as e:
+        logging.error(f"Could not read active project list from SQL: {e}")
+        return
+
+    reader_conn = _connect_sql(kv_client, SQL_READER_USER, SQL_READER_PASSWORD_SECRET_NAME)
+    writer_conn = _connect_sql(kv_client, SQL_RECONCILE_WRITER_USER, SQL_RECONCILE_WRITER_PASSWORD_SECRET_NAME)
+
+    try:
+        for project in projects:
+            project_code = project["ProjectCode"]
+            try:
+                if project["SourceSystem"] == "AzureDevOps":
+                    flagged = _reconcile_devops_project(kv_client, reader_conn, writer_conn, project)
+                elif project["SourceSystem"] == "Jira":
+                    flagged = _reconcile_jira_project(kv_client, reader_conn, writer_conn, project)
+                else:
+                    logging.warning(f"{project_code}: unknown SourceSystem, skipping reconciliation.")
+                    continue
+                logging.info(f"{project_code}: flagged {flagged} deleted work item(s).")
+            except Exception as e:
+                logging.error(f"{project_code}: reconciliation failed — {e}")
+    finally:
+        reader_conn.close()
+        writer_conn.close()

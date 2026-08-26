@@ -51,6 +51,89 @@ FALLBACK_DEVOPS_SECRET_NAME = "devops-pat-darkspark-all-hazel"
 # ------------------------------
 
 
+@app.function_name(name="TestReconcile")
+@app.route(route="test-reconcile", auth_level=func.AuthLevel.FUNCTION)
+def test_reconcile(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Manual debug probe for the reconciliation job. Call with:
+      GET https://<your-func-app>.azurewebsites.net/api/test-reconcile?code=<function-key>&project_code=ZEUS-DAAC
+
+    Runs the same logic as ReconcileDeletedWorkItems but for ONE project only,
+    and returns each step's outcome directly in the response body instead of
+    relying on Monitor/Application Insights access.
+    """
+    project_code_filter = req.params.get("project_code")
+    if not project_code_filter:
+        return func.HttpResponse(
+            "Pass ?project_code=<code>, e.g. ZEUS-DAAC", status_code=400
+        )
+
+    log_lines = []
+
+    def log(msg):
+        log_lines.append(msg)
+
+    try:
+        credential = DefaultAzureCredential()
+        kv_client = SecretClient(vault_url=KEY_VAULT_URL, credential=credential)
+        log("✓ Key Vault client created")
+    except Exception as e:
+        return func.HttpResponse(f"✗ Key Vault client creation failed: {e}", status_code=500)
+
+    try:
+        projects = _get_active_projects(kv_client)
+        log(f"✓ Pulled {len(projects)} active project(s) from SQL")
+    except Exception as e:
+        return func.HttpResponse("\n".join(log_lines) + f"\n✗ _get_active_projects failed: {e}", status_code=500)
+
+    project = next((p for p in projects if p["ProjectCode"] == project_code_filter), None)
+    if not project:
+        return func.HttpResponse(
+            "\n".join(log_lines) + f"\n✗ Project '{project_code_filter}' not found in "
+            f"vw_ActiveExportableProjects. Available: {[p['ProjectCode'] for p in projects]}",
+            status_code=404,
+        )
+    log(f"✓ Found project config: {project}")
+
+    try:
+        reader_conn = _connect_sql(kv_client, SQL_READER_USER, SQL_READER_PASSWORD_SECRET_NAME)
+        log("✓ Reader SQL connection succeeded")
+    except Exception as e:
+        return func.HttpResponse("\n".join(log_lines) + f"\n✗ Reader SQL connection failed: {e}", status_code=500)
+
+    try:
+        writer_conn = _connect_sql(kv_client, SQL_RECONCILE_WRITER_USER, SQL_RECONCILE_WRITER_PASSWORD_SECRET_NAME)
+        log("✓ Writer SQL connection succeeded")
+    except Exception as e:
+        reader_conn.close()
+        return func.HttpResponse("\n".join(log_lines) + f"\n✗ Writer SQL connection failed: {e}", status_code=500)
+
+    try:
+        existing_ids = _get_existing_work_item_ids(
+            reader_conn, project_code_filter,
+            "AzureDevOps" if project["SourceSystem"] == "AzureDevOps" else "Jira"
+        )
+        log(f"✓ Existing (non-deleted) IDs in SQL: {len(existing_ids)} — sample: {list(existing_ids)[:10]}")
+    except Exception as e:
+        reader_conn.close(); writer_conn.close()
+        return func.HttpResponse("\n".join(log_lines) + f"\n✗ Reading existing IDs failed: {e}", status_code=500)
+
+    try:
+        if project["SourceSystem"] == "AzureDevOps":
+            flagged = _reconcile_devops_project(kv_client, reader_conn, writer_conn, project)
+        elif project["SourceSystem"] == "Jira":
+            flagged = _reconcile_jira_project(kv_client, reader_conn, writer_conn, project)
+        else:
+            raise ValueError(f"Unknown SourceSystem: {project['SourceSystem']}")
+        log(f"✓ Reconciliation completed — flagged {flagged} deleted work item(s)")
+    except Exception as e:
+        reader_conn.close(); writer_conn.close()
+        return func.HttpResponse("\n".join(log_lines) + f"\n✗ Reconciliation logic failed: {e}", status_code=500)
+
+    reader_conn.close()
+    writer_conn.close()
+    return func.HttpResponse("\n".join(log_lines) + "\n\n>>> SUCCESS <<<", status_code=200)
+
 @app.function_name(name="TestDevOpsAuth")
 @app.route(route="test-devops-auth", auth_level=func.AuthLevel.FUNCTION)
 def test_devops_auth(req: func.HttpRequest) -> func.HttpResponse:

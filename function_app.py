@@ -26,9 +26,9 @@ DEVOPS_ORG = "DarkSparkConsulting"
 
 # --- Central SQL pause/resume config ---
 SUBSCRIPTION_ID = "9af8ed4d-1ade-425e-870f-bd79eb8e00ce"
-RESOURCE_GROUP = "HC_Experiments"
+RESOURCE_GROUP = "DSPR"
 SQL_SERVER_NAME = "centralsystem"
-SQL_DATABASE_NAME = "darkspark-central-system"
+SQL_DATABASE_NAME = "DSPR-PROD-01"
 SQL_RECONCILE_WRITER_USER = "func_project_reconcile_writer"
 SQL_RECONCILE_WRITER_PASSWORD_SECRET_NAME = "sql-func-project-reconcile-writer-password"
 # ----------------------------------------

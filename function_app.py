@@ -22,6 +22,12 @@ app = func.FunctionApp()
 # --- Configure these two for your tenant ---
 KEY_VAULT_URL = "https://kv-centralsystem.vault.azure.net/"
 DEVOPS_ORG = "DarkSparkConsulting"
+
+# OTS Area Path mappings
+DEVOPS_AREA_PATHS = {
+    "OTSG-SALE": "OTS\\Sales Data Support",
+    "OTSG-FINC": "OTS\\Finance Data Support",
+}
 # --------------------------------------------
 
 # --- Central SQL pause/resume config ---
@@ -239,7 +245,15 @@ def _process_devops_project(kv_client: SecretClient, blob_service_client: BlobSe
     session = requests.Session()
     session.auth = ("", pat)
 
-    ids = devops_exporter.fetch_work_item_ids(session, project["OrgOrSite"], project["SourceProjectName"], since_dt)
+    area_path = DEVOPS_AREA_PATHS.get(project_code)
+
+    ids = devops_exporter.fetch_work_item_ids(
+        session,
+        project["OrgOrSite"],
+        project["SourceProjectName"],
+        since_dt,
+        area_path=area_path
+    )
     if not ids:
         logging.info(f"{project_code}: no work items in this window.")
         _save_watermark(blob_service_client, project_code, run_start_utc)
@@ -378,9 +392,17 @@ def _reconcile_devops_project(kv_client: SecretClient, reader_conn, writer_conn,
     # since_dt=None -> full pull of every currently-live work item ID.
     # devops_export_to_payload's WIQL already excludes State='Removed', so
     # soft-removed and hard-deleted items both fall out of this list.
-    live_ids = {str(i) for i in devops_exporter.fetch_work_item_ids(
-        session, project["OrgOrSite"], project["SourceProjectName"], None
-    )}
+    area_path = DEVOPS_AREA_PATHS.get(project_code)
+
+    live_ids = {
+        str(i) for i in devops_exporter.fetch_work_item_ids(
+            session,
+            project["OrgOrSite"],
+            project["SourceProjectName"],
+            None,
+            area_path=area_path
+        )
+    }
 
     existing_ids = _get_existing_work_item_ids(reader_conn, project_code, "AzureDevOps")
     deleted_ids = list(existing_ids - live_ids)

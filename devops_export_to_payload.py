@@ -266,24 +266,36 @@ def resolve_since(args, output_dir, project_code):
     return None, "no watermark found - full export"
 
 
-def build_wiql(project, since_dt):
+def build_wiql(project, since_dt, area_path=None):
     query = (
         "SELECT [System.Id] FROM WorkItems "
         "WHERE [System.TeamProject] = @project "
         "AND [System.State] <> 'Removed' "
     )
+
+    if area_path:
+        safe_area_path = area_path.replace("'", "''")
+        query += f"AND [System.AreaPath] = '{safe_area_path}' "
+
     if since_dt is not None:
         since_literal = since_dt.astimezone(timezone.utc).strftime(WIQL_DATETIME_FMT)
         query += f"AND [System.ChangedDate] >= '{since_literal}' "
+
     query += "ORDER BY [System.Id]"
     return query
 
 
-def fetch_work_item_ids(session, org, project, since_dt):
-    url = f"https://dev.azure.com/{org}/{project}/_apis/wit/wiql?timePrecision=true&api-version={API_VERSION}"
-    wiql = {"query": build_wiql(project, since_dt)}
+def fetch_work_item_ids(session, org, project, since_dt, area_path=None):
+    url = (
+        f"https://dev.azure.com/{org}/{project}/_apis/wit/wiql"
+        f"?timePrecision=true&api-version={API_VERSION}"
+    )
+
+    wiql = {"query": build_wiql(project, since_dt, area_path)}
+
     resp = session.post(url, json=wiql)
     resp.raise_for_status()
+
     return [wi["id"] for wi in resp.json().get("workItems", [])]
 
 

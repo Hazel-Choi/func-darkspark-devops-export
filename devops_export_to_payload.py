@@ -138,6 +138,7 @@ STANDARD_COLUMNS = [
     "CreatedDate", "ChangedDate", "StateChangeDate", "ClosedDate",
     "EffortValue", "EfforUnit", "IsBlocked",
     "OriginalEstimateHours", "RemainingWorkHours", "SnapshotDate",
+    "DueDate", "ActionProject",
 ]
 
 # Requested fields. Effort is process-template-specific (Agile vs Scrum vs
@@ -152,6 +153,8 @@ FIELD_REFS = [
     "Microsoft.VSTS.Scheduling.RemainingWork",
     "Microsoft.VSTS.Scheduling.OriginalEstimate",
     "Microsoft.VSTS.CMMI.Blocked", "System.Tags",
+    "Microsoft.VSTS.Scheduling.DueDate",
+    "Custom.Project",
 ]
 
 BATCH_SIZE = 200
@@ -354,6 +357,8 @@ def build_rows(work_items, project_code, effort_unit):
             # ticket that never carried this field doesn't get a false
             # "0 hours remaining" history row downstream.
             "SnapshotDate": snapshot_date if remaining_work not in ("", None) else "",
+            "DueDate": iso_date_only(f.get("Microsoft.VSTS.Scheduling.DueDate")),
+            "ActionProject": f.get("Custom.Project", ""),
         })
     return rows
 
